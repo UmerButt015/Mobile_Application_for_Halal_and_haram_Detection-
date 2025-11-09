@@ -1,0 +1,1 @@
+# Mobile_Application_for_Halal_and_haram_Detection-
