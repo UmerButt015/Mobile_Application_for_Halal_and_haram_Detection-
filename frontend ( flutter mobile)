@@ -1,0 +1,1609 @@
+# flutter frontend code 
+import 'dart:convert';
+import 'dart:io';
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+
+// Main App
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  try {
+    final cameras = await availableCameras();
+    runApp(HalalDetectorApp(cameras: cameras));
+  } catch (e) {
+    runApp(const HalalDetectorApp(cameras: []));
+  }
+}
+
+class HalalDetectorApp extends StatelessWidget {
+  final List<CameraDescription> cameras;
+
+  const HalalDetectorApp({super.key, required this.cameras});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Halal Detector',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        fontFamily: 'Poppins',
+        useMaterial3: true,
+      ),
+      home: HomeScreen(cameras: cameras),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+// Models
+class Detection {
+  final String class_name;
+  final double confidence;
+  final List<double> bbox;
+  final int class_id;
+
+  Detection({
+    required this.class_name,
+    required this.confidence,
+    required this.bbox,
+    required this.class_id,
+  });
+
+  factory Detection.fromJson(Map<String, dynamic> json) {
+    return Detection(
+      class_name: json['class_name'],
+      confidence: (json['confidence'] as num).toDouble(),
+      bbox: List<double>.from(json['bbox']),
+      class_id: json['class_id'],
+    );
+  }
+}
+
+class DetectionResult {
+  final bool success;
+  final String detection_id;
+  final List<Detection> detections;
+  final int count;
+  final Map<String, dynamic> image_size;
+  final String? result_image;
+  final String timestamp;
+  final String? message;
+
+  DetectionResult({
+    required this.success,
+    required this.detection_id,
+    required this.detections,
+    required this.count,
+    required this.image_size,
+    this.result_image,
+    required this.timestamp,
+    this.message,
+  });
+
+  factory DetectionResult.fromJson(Map<String, dynamic> json) {
+    return DetectionResult(
+      success: json['success'] ?? false,
+      detection_id: json['detection_id'] ?? '',
+      detections:
+          (json['detections'] as List?)
+              ?.map((detection) => Detection.fromJson(detection))
+              .toList() ??
+          [],
+      count: json['count'] ?? 0,
+      image_size: Map<String, dynamic>.from(json['image_size'] ?? {}),
+      result_image: json['result_image'],
+      timestamp: json['timestamp'] ?? '',
+      message: json['message'],
+    );
+  }
+}
+
+class HistoryItem {
+  final String id;
+  final String timestamp;
+  final List<Detection> detections;
+  final Map<String, dynamic> image_size;
+  final String? image_url;
+  final int total_detections;
+
+  HistoryItem({
+    required this.id,
+    required this.timestamp,
+    required this.detections,
+    required this.image_size,
+    this.image_url,
+    required this.total_detections,
+  });
+
+  factory HistoryItem.fromJson(Map<String, dynamic> json) {
+    return HistoryItem(
+      id: json['id'] ?? '',
+      timestamp: json['timestamp'] ?? '',
+      detections:
+          (json['detections'] as List?)
+              ?.map((detection) => Detection.fromJson(detection))
+              .toList() ??
+          [],
+      image_size: Map<String, dynamic>.from(json['image_size'] ?? {}),
+      image_url: json['image_url'],
+      total_detections: json['total_detections'] ?? 0,
+    );
+  }
+}
+
+// API Service
+class ApiService {
+  // Platform-aware base URL. Use localhost for web and simulator, 10.0.2.2 for
+  // Android emulator so the emulator can reach the host machine.
+  static String get baseUrl {
+    if (kIsWeb) return 'http://localhost:8000';
+    try {
+      if (Platform.isAndroid) return 'http://10.0.2.2:8000';
+    } catch (_) {
+      // Platform not available (e.g. web) — fall back to localhost
+    }
+    return 'http://localhost:8000';
+  }
+
+  /// Detect halal logos in an image. Accepts either a platform [File]
+  /// (mobile/desktop) or raw image bytes (web). Returns a [DetectionResult].
+  static Future<DetectionResult> detectHalal({
+    File? imageFile,
+    Uint8List? imageBytes,
+    String? filename,
+  }) async {
+    try {
+      var uri = Uri.parse('${baseUrl.replaceAll(RegExp(r'/$'), '')}/detect');
+      var request = http.MultipartRequest('POST', uri);
+
+      if (imageBytes != null) {
+        // Web path: upload bytes with a filename
+        final name = filename ?? 'upload.jpg';
+        var ext = name.split('.').last.toLowerCase();
+        if (ext == 'jpg') ext = 'jpeg';
+        final contentType = MediaType('image', ext);
+        request.files.add(
+          http.MultipartFile.fromBytes(
+            'file',
+            imageBytes,
+            filename: name,
+            contentType: contentType,
+          ),
+        );
+      } else if (imageFile != null) {
+        // Mobile/desktop path: upload from path
+        request.files.add(
+          await http.MultipartFile.fromPath('file', imageFile.path),
+        );
+      } else {
+        throw Exception('No image provided');
+      }
+
+      final streamed = await request.send();
+      final respStr = await streamed.stream.bytesToString();
+      final jsonResponse = json.decode(respStr);
+
+      if (streamed.statusCode == 200) {
+        return DetectionResult.fromJson(jsonResponse);
+      } else {
+        throw Exception(
+          'Failed to detect: ${jsonResponse['detail'] ?? respStr}',
+        );
+      }
+    } catch (e) {
+      throw Exception('Network error: $e');
+    }
+  }
+
+  static Future<List<HistoryItem>> getHistory() async {
+    try {
+      final response = await http.get(Uri.parse('$baseUrl/history?limit=20'));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return (data['history'] as List)
+            .map((item) => HistoryItem.fromJson(item))
+            .toList();
+      }
+
+      // If endpoint not found (404) return empty history instead of throwing.
+      if (response.statusCode == 404) {
+        debugPrint('History endpoint not found (404) — returning empty list');
+        return [];
+      }
+
+      throw Exception('Failed to load history: ${response.statusCode}');
+    } catch (e) {
+      throw Exception('Network error: $e');
+    }
+  }
+
+  static Future<Map<String, dynamic>> getHealth() async {
+    try {
+      final response = await http.get(Uri.parse('$baseUrl/health'));
+
+      if (response.statusCode == 200) {
+        return json.decode(response.body);
+      } else {
+        throw Exception('Health check failed: ${response.statusCode}');
+      }
+    } catch (e) {
+      throw Exception('Network error: $e');
+    }
+  }
+
+  static Future<Map<String, dynamic>> testConnection() async {
+    try {
+      // Prefer health endpoint if available — it provides structured info.
+      final response = await http.get(Uri.parse('$baseUrl/health'));
+
+      if (response.statusCode == 200) {
+        return json.decode(response.body);
+      }
+
+      // Fallback to root if /health not available
+      final root = await http.get(Uri.parse('$baseUrl/'));
+      if (root.statusCode == 200) return json.decode(root.body);
+
+      throw Exception('Connection test failed: ${response.statusCode}');
+    } catch (e) {
+      throw Exception('Cannot connect to server: $e');
+    }
+  }
+}
+
+// Main Home Screen
+class HomeScreen extends StatefulWidget {
+  final List<CameraDescription> cameras;
+
+  const HomeScreen({super.key, required this.cameras});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _animationController;
+  late Animation<double> _scaleAnimation;
+  late Animation<double> _fadeAnimation;
+
+  List<HistoryItem> _history = [];
+  bool _isLoading = false;
+  bool _apiConnected = false;
+  String _connectionStatus = 'Checking...';
+
+  @override
+  void initState() {
+    super.initState();
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000),
+    );
+
+    _scaleAnimation = Tween<double>(begin: 0.8, end: 1.0).animate(
+      CurvedAnimation(parent: _animationController, curve: Curves.elasticOut),
+    );
+
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _animationController, curve: Curves.easeIn),
+    );
+
+    _animationController.forward();
+    _checkApiConnection();
+    _loadHistory();
+  }
+
+  Future<void> _checkApiConnection() async {
+    try {
+      final health = await ApiService.testConnection();
+      setState(() {
+        _apiConnected = true;
+        _connectionStatus = 'Connected ✅';
+      });
+      print('API Health: $health');
+    } catch (e) {
+      setState(() {
+        _apiConnected = false;
+        _connectionStatus = 'Disconnected ❌';
+      });
+      print('API Connection Error: $e');
+    }
+  }
+
+  Future<void> _loadHistory() async {
+    try {
+      final history = await ApiService.getHistory();
+      setState(() => _history = history);
+    } catch (e) {
+      print('History load error: $e');
+    }
+  }
+
+  void _showImageSourceDialog() {
+    showModalBottomSheet(
+      context: context,
+      builder:
+          (context) => Container(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.photo_library, color: Colors.blue),
+                  title: const Text('Gallery'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _pickImageFromGallery();
+                  },
+                ),
+                if (widget.cameras.isNotEmpty)
+                  ListTile(
+                    leading: const Icon(Icons.camera_alt, color: Colors.green),
+                    title: const Text('Camera'),
+                    onTap: () {
+                      Navigator.pop(context);
+                      _openCameraScreen();
+                    },
+                  ),
+              ],
+            ),
+          ),
+    );
+  }
+
+  Future<void> _pickImageFromGallery() async {
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
+
+    if (pickedFile != null) {
+      if (kIsWeb) {
+        // On web, avoid dart:io File; use bytes instead
+        final bytes = await pickedFile.readAsBytes();
+        await _processImage(imageBytes: bytes, filename: pickedFile.name);
+      } else {
+        _processImage(imageFile: File(pickedFile.path));
+      }
+    }
+  }
+
+  void _openCameraScreen() {
+    if (widget.cameras.isNotEmpty) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => CameraScreen(cameras: widget.cameras),
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Camera not available')));
+    }
+  }
+
+  Future<void> _processImage({
+    File? imageFile,
+    Uint8List? imageBytes,
+    String? filename,
+  }) async {
+    if (!_apiConnected) {
+      _showErrorDialog('Connection Error', 'Please check backend connection');
+      return;
+    }
+
+    setState(() => _isLoading = true);
+
+    try {
+      DetectionResult result;
+      if (imageBytes != null) {
+        result = await ApiService.detectHalal(
+          imageBytes: imageBytes,
+          filename: filename,
+        );
+        _showDetectionResult(result, null, originalBytes: imageBytes);
+      } else if (imageFile != null) {
+        result = await ApiService.detectHalal(imageFile: imageFile);
+        _showDetectionResult(result, imageFile);
+      } else {
+        throw Exception('No image provided');
+      }
+
+      _loadHistory();
+    } catch (e) {
+      _showErrorDialog('Detection Failed', e.toString());
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  void _showDetectionResult(
+    DetectionResult result,
+    File? originalImage, {
+    Uint8List? originalBytes,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder:
+            (context) => ResultScreen(
+              result: result,
+              originalImage: originalImage,
+              originalImageBytes: originalBytes,
+            ),
+      ),
+    );
+  }
+
+  void _showErrorDialog(String title, String message) {
+    showDialog(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: Text(title),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  void _retryConnection() {
+    setState(() {
+      _connectionStatus = 'Checking...';
+    });
+    _checkApiConnection();
+    _loadHistory();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            // Background Gradient
+            Container(
+              width: double.infinity,
+              height: double.infinity,
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Color(0xFF667eea), Color(0xFF764ba2)],
+                ),
+              ),
+            ),
+
+            // Content
+            SingleChildScrollView(
+              physics: const BouncingScrollPhysics(),
+              child: Column(
+                children: [
+                  // Header
+                  ScaleTransition(
+                    scale: _scaleAnimation,
+                    child: FadeTransition(
+                      opacity: _fadeAnimation,
+                      child: Container(
+                        padding: const EdgeInsets.all(30),
+                        child: Column(
+                          children: [
+                            const SizedBox(height: 20),
+                            // App Icon
+                            Container(
+                              width: 80,
+                              height: 80,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: const Icon(
+                                Icons.mosque,
+                                color: Colors.white,
+                                size: 40,
+                              ),
+                            ),
+                            const SizedBox(height: 20),
+                            // Title
+                            const Text(
+                              'Halal Detector',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 32,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            // Subtitle
+                            const Text(
+                              'AI-Powered Halal Logo Detection',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 16,
+                              ),
+                            ),
+                            const SizedBox(height: 20),
+                            // API Status
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color:
+                                    _apiConnected
+                                        ? Colors.green.withOpacity(0.2)
+                                        : Colors.red.withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    _apiConnected
+                                        ? Icons.check_circle
+                                        : Icons.error,
+                                    color:
+                                        _apiConnected
+                                            ? Colors.green
+                                            : Colors.red,
+                                    size: 16,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    _connectionStatus,
+                                    style: TextStyle(
+                                      color:
+                                          _apiConnected
+                                              ? Colors.green
+                                              : Colors.red,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  if (!_apiConnected) ...[
+                                    const SizedBox(width: 8),
+                                    GestureDetector(
+                                      onTap: _retryConnection,
+                                      child: const Icon(
+                                        Icons.refresh,
+                                        color: Colors.white,
+                                        size: 16,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // Main Content
+                  Container(
+                    width: double.infinity,
+                    constraints: BoxConstraints(
+                      minHeight: MediaQuery.of(context).size.height * 0.6,
+                    ),
+                    decoration: const BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.only(
+                        topLeft: Radius.circular(40),
+                        topRight: Radius.circular(40),
+                      ),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          // Scan Button
+                          _buildScanButton(),
+                          const SizedBox(height: 30),
+
+                          // Recent Detections
+                          _buildRecentDetections(),
+                          const SizedBox(height: 30),
+
+                          // Features Grid
+                          _buildFeaturesGrid(),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // Loading Overlay
+            if (_isLoading)
+              Container(
+                color: Colors.black.withOpacity(0.5),
+                child: const Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      CircularProgressIndicator(
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.blue),
+                      ),
+                      SizedBox(height: 20),
+                      Text(
+                        'Analyzing Image...',
+                        style: TextStyle(color: Colors.white, fontSize: 16),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildScanButton() {
+    return Center(
+      child: Column(
+        children: [
+          Container(
+            width: 200,
+            height: 200,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: const LinearGradient(
+                colors: [Color(0xFF4facfe), Color(0xFF00f2fe)],
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blue.withOpacity(0.3),
+                  blurRadius: 20,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: _showImageSourceDialog,
+                borderRadius: BorderRadius.circular(100),
+                child: const Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.scanner, color: Colors.white, size: 50),
+                    SizedBox(height: 10),
+                    Text(
+                      'SCAN NOW',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          if (!_apiConnected)
+            Text(
+              'Backend not connected',
+              style: TextStyle(color: Colors.red, fontSize: 12),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRecentDetections() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Text(
+              'Recent Detections',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const Spacer(),
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: _loadHistory,
+              tooltip: 'Refresh History',
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        _history.isEmpty
+            ? _buildEmptyHistory()
+            : SizedBox(
+              height: 120,
+              child: ListView.builder(
+                scrollDirection: Axis.horizontal,
+                itemCount: _history.length,
+                itemBuilder: (context, index) {
+                  return _buildHistoryItem(_history[index]);
+                },
+              ),
+            ),
+      ],
+    );
+  }
+
+  Widget _buildEmptyHistory() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.grey[50],
+        borderRadius: BorderRadius.circular(15),
+      ),
+      child: Column(
+        children: [
+          Icon(Icons.history, color: Colors.grey[400], size: 40),
+          const SizedBox(height: 10),
+          Text(
+            'No detection history',
+            style: TextStyle(color: Colors.grey[600]),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            'Scan images to see history here',
+            style: TextStyle(color: Colors.grey[500], fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryItem(HistoryItem item) {
+    return GestureDetector(
+      onTap: () {
+        _showHistoryDetails(item);
+      },
+      child: Container(
+        width: 100,
+        margin: const EdgeInsets.only(right: 12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.1),
+              blurRadius: 10,
+              offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            // Image
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(12),
+                    topRight: Radius.circular(12),
+                  ),
+                  image:
+                      item.image_url != null
+                          ? DecorationImage(
+                            image: NetworkImage(
+                              '${ApiService.baseUrl}${item.image_url!.startsWith('/') ? '' : '/'}${item.image_url!}',
+                            ),
+                            fit: BoxFit.cover,
+                          )
+                          : null,
+                  color: Colors.grey[200],
+                ),
+                child:
+                    item.image_url == null
+                        ? const Icon(Icons.photo, color: Colors.grey)
+                        : null,
+              ),
+            ),
+            // Info
+            Container(
+              padding: const EdgeInsets.all(8),
+              child: Column(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color:
+                          item.total_detections > 0 ? Colors.green : Colors.red,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      item.total_detections > 0
+                          ? '${item.total_detections}'
+                          : '0',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _formatTime(item.timestamp),
+                    style: const TextStyle(fontSize: 10, color: Colors.grey),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showHistoryDetails(HistoryItem item) {
+    showDialog(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Detection Details'),
+            content: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (item.image_url != null)
+                    Container(
+                      height: 200,
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(10),
+                        image: DecorationImage(
+                          image: NetworkImage(
+                            '${ApiService.baseUrl}${item.image_url!.startsWith('/') ? '' : '/'}${item.image_url!}',
+                          ),
+                          fit: BoxFit.cover,
+                        ),
+                      ),
+                    ),
+                  const SizedBox(height: 16),
+                  Text('Detections: ${item.total_detections}'),
+                  Text('Time: ${_formatDateTime(item.timestamp)}'),
+                  if (item.detections.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    const Text('Found:'),
+                    ...item.detections.map(
+                      (detection) => Text(
+                        '  • ${detection.class_name} (${(detection.confidence * 100).toStringAsFixed(1)}%)',
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Close'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  Widget _buildFeaturesGrid() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Features',
+          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 16),
+        GridView.count(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          crossAxisCount: 2,
+          crossAxisSpacing: 16,
+          mainAxisSpacing: 16,
+          children: [
+            if (widget.cameras.isNotEmpty)
+              _buildFeatureCard(
+                icon: Icons.camera_alt,
+                title: 'Live Camera',
+                color: Colors.green,
+                onTap: _openCameraScreen,
+              ),
+            _buildFeatureCard(
+              icon: Icons.photo_library,
+              title: 'Gallery',
+              color: Colors.blue,
+              onTap: _pickImageFromGallery,
+            ),
+            _buildFeatureCard(
+              icon: Icons.history,
+              title: 'Full History',
+              color: Colors.orange,
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => HistoryScreen()),
+                );
+              },
+            ),
+            _buildFeatureCard(
+              icon: Icons.settings,
+              title: 'Settings',
+              color: Colors.purple,
+              onTap: () {
+                _showSettings();
+              },
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  void _showSettings() {
+    showDialog(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Settings'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Backend Configuration'),
+                const SizedBox(height: 10),
+                Text('Status: $_connectionStatus'),
+                const SizedBox(height: 10),
+                Text('URL: ${ApiService.baseUrl}'),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: _retryConnection,
+                child: const Text('Retry Connection'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Close'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  Widget _buildFeatureCard({
+    required IconData icon,
+    required String title,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(15),
+        child: Container(
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.1),
+            borderRadius: BorderRadius.circular(15),
+            border: Border.all(color: color.withOpacity(0.2)),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: color, size: 30),
+              const SizedBox(height: 8),
+              Text(
+                title,
+                style: TextStyle(color: color, fontWeight: FontWeight.w600),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _formatTime(String timestamp) {
+    try {
+      final date = DateTime.parse(timestamp);
+      return '${date.hour}:${date.minute.toString().padLeft(2, '0')}';
+    } catch (e) {
+      return '--:--';
+    }
+  }
+
+  String _formatDateTime(String timestamp) {
+    try {
+      final date = DateTime.parse(timestamp);
+      return '${date.day}/${date.month}/${date.year} ${date.hour}:${date.minute.toString().padLeft(2, '0')}';
+    } catch (e) {
+      return 'Unknown';
+    }
+  }
+
+  @override
+  void dispose() {
+    _animationController.dispose();
+    super.dispose();
+  }
+}
+
+// Camera Screen
+class CameraScreen extends StatefulWidget {
+  final List<CameraDescription> cameras;
+
+  const CameraScreen({super.key, required this.cameras});
+
+  @override
+  State<CameraScreen> createState() => _CameraScreenState();
+}
+
+class _CameraScreenState extends State<CameraScreen> {
+  late CameraController _controller;
+  late Future<void> _initializeControllerFuture;
+  bool _isCameraInitialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeCamera();
+  }
+
+  Future<void> _initializeCamera() async {
+    try {
+      final camera = widget.cameras.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.back,
+        orElse: () => widget.cameras.first,
+      );
+
+      _controller = CameraController(
+        camera,
+        ResolutionPreset.high,
+        enableAudio: false,
+      );
+
+      _initializeControllerFuture = _controller.initialize().then((_) {
+        if (!mounted) return;
+        setState(() => _isCameraInitialized = true);
+      });
+    } catch (e) {
+      print("Error initializing camera: $e");
+    }
+  }
+
+  Future<void> _takePicture() async {
+    try {
+      await _initializeControllerFuture;
+
+      if (!_isCameraInitialized) {
+        print("Camera not initialized");
+        return;
+      }
+
+      final image = await _controller.takePicture();
+
+      if (!mounted) return;
+
+      if (kIsWeb) {
+        // On web, read bytes and pass them to ResultScreen
+        final bytes = await image.readAsBytes();
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder:
+                (context) => ResultScreen(
+                  result: null,
+                  originalImage: null,
+                  originalImageBytes: bytes,
+                ),
+          ),
+        );
+      } else {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder:
+                (context) =>
+                    ResultScreen(result: null, originalImage: File(image.path)),
+          ),
+        );
+      }
+    } catch (e) {
+      print("Error taking picture: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Error taking picture')));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: FutureBuilder<void>(
+        future: _initializeControllerFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.done) {
+            return Stack(
+              children: [
+                // Camera Preview
+                if (_isCameraInitialized)
+                  CameraPreview(_controller)
+                else
+                  const Center(child: CircularProgressIndicator()),
+
+                // Overlay
+                Positioned.fill(
+                  child: Column(
+                    children: [
+                      // Header
+                      AppBar(
+                        backgroundColor: Colors.transparent,
+                        elevation: 0,
+                        leading: IconButton(
+                          icon: const Icon(
+                            Icons.arrow_back,
+                            color: Colors.white,
+                          ),
+                          onPressed: () => Navigator.pop(context),
+                        ),
+                      ),
+
+                      const Spacer(),
+
+                      // Capture Button
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 50),
+                        child: FloatingActionButton(
+                          onPressed: _takePicture,
+                          backgroundColor: Colors.white,
+                          child: const Icon(
+                            Icons.camera,
+                            color: Colors.black,
+                            size: 30,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          } else {
+            return const Center(child: CircularProgressIndicator());
+          }
+        },
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+}
+
+// Result Screen
+class ResultScreen extends StatefulWidget {
+  final DetectionResult? result;
+  final File? originalImage;
+  final Uint8List? originalImageBytes;
+
+  const ResultScreen({
+    super.key,
+    required this.result,
+    this.originalImage,
+    this.originalImageBytes,
+  });
+
+  @override
+  State<ResultScreen> createState() => _ResultScreenState();
+}
+
+class _ResultScreenState extends State<ResultScreen> {
+  bool _isProcessing = true;
+  DetectionResult? _result;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.result != null) {
+      _result = widget.result;
+      _isProcessing = false;
+    } else {
+      _processImage();
+    }
+  }
+
+  Future<void> _processImage() async {
+    try {
+      DetectionResult result;
+      if (widget.originalImageBytes != null) {
+        result = await ApiService.detectHalal(
+          imageBytes: widget.originalImageBytes,
+          filename: 'capture.jpg',
+        );
+      } else if (widget.originalImage != null) {
+        result = await ApiService.detectHalal(imageFile: widget.originalImage);
+      } else {
+        throw Exception('No image provided to process');
+      }
+      setState(() {
+        _result = result;
+        _isProcessing = false;
+      });
+    } catch (e) {
+      setState(() => _isProcessing = false);
+      _showErrorDialog('Detection Failed', e.toString());
+    }
+  }
+
+  void _showErrorDialog(String title, String message) {
+    showDialog(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: Text(title),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Detection Results'),
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        elevation: 0,
+      ),
+      body:
+          _isProcessing
+              ? const Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 20),
+                    Text('Processing Image...'),
+                  ],
+                ),
+              )
+              : _buildResultContent(),
+    );
+  }
+
+  Widget _buildResultContent() {
+    final hasDetections = _result!.detections.isNotEmpty;
+
+    return SingleChildScrollView(
+      physics: const BouncingScrollPhysics(),
+      child: Column(
+        children: [
+          // Image
+          Container(
+            width: double.infinity,
+            height: 300,
+            decoration: BoxDecoration(
+              image: DecorationImage(
+                image:
+                    widget.originalImageBytes != null
+                        ? MemoryImage(widget.originalImageBytes!)
+                            as ImageProvider
+                        : (widget.originalImage != null
+                            ? FileImage(widget.originalImage!)
+                            : const AssetImage(
+                              'assets/images/placeholder.png',
+                            )),
+                fit: BoxFit.cover,
+              ),
+            ),
+          ),
+
+          // Results Summary
+          Container(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Summary Card
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: hasDetections ? Colors.green[50] : Colors.grey[50],
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(
+                      color: hasDetections ? Colors.green : Colors.grey,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        hasDetections ? Icons.check_circle : Icons.info,
+                        color: hasDetections ? Colors.green : Colors.grey,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              hasDetections
+                                  ? '${_result!.detections.length} halal logo(s) detected'
+                                  : 'No halal logos detected',
+                              style: TextStyle(
+                                color:
+                                    hasDetections ? Colors.green : Colors.grey,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            if (_result!.message != null) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                _result!.message!,
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 20),
+
+                // Detections List
+                if (hasDetections) ...[
+                  const Text(
+                    'Detected Logos',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 12),
+                  ..._result!.detections.map(
+                    (detection) => _buildDetectionCard(detection),
+                  ),
+                ],
+
+                // Actions
+                const SizedBox(height: 20),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: () => Navigator.pop(context),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.grey[200],
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(vertical: 15),
+                        ),
+                        child: const Text('Scan Again'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDetectionCard(Detection detection) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            // Confidence Indicator
+            Container(
+              width: 60,
+              height: 60,
+              decoration: BoxDecoration(
+                color: _getConfidenceColor(detection.confidence),
+                shape: BoxShape.circle,
+              ),
+              child: Center(
+                child: Text(
+                  '${(detection.confidence * 100).toInt()}%',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    detection.class_name,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Confidence: ${(detection.confidence * 100).toStringAsFixed(1)}%',
+                    style: TextStyle(color: Colors.grey[600]),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Color _getConfidenceColor(double confidence) {
+    if (confidence > 0.8) return Colors.green;
+    if (confidence > 0.5) return Colors.orange;
+    return Colors.red;
+  }
+}
+
+// History Screen
+class HistoryScreen extends StatefulWidget {
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  List<HistoryItem> _history = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHistory();
+  }
+
+  Future<void> _loadHistory() async {
+    try {
+      final history = await ApiService.getHistory();
+      setState(() {
+        _history = history;
+        _isLoading = false;
+      });
+    } catch (e) {
+      setState(() => _isLoading = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Failed to load history')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Detection History'),
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _loadHistory),
+        ],
+      ),
+      body:
+          _isLoading
+              ? const Center(child: CircularProgressIndicator())
+              : _history.isEmpty
+              ? _buildEmptyHistory()
+              : _buildHistoryList(),
+    );
+  }
+
+  Widget _buildEmptyHistory() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.history, size: 80, color: Colors.grey[400]),
+          const SizedBox(height: 20),
+          Text(
+            'No detection history',
+            style: TextStyle(fontSize: 18, color: Colors.grey[600]),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Start scanning to see your history here',
+            style: TextStyle(color: Colors.grey[500]),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryList() {
+    return RefreshIndicator(
+      onRefresh: _loadHistory,
+      child: ListView.builder(
+        itemCount: _history.length,
+        itemBuilder: (context, index) {
+          return _buildHistoryListItem(_history[index]);
+        },
+      ),
+    );
+  }
+
+  Widget _buildHistoryListItem(HistoryItem item) {
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: ListTile(
+        leading: Container(
+          width: 50,
+          height: 50,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            image:
+                item.image_url != null
+                    ? DecorationImage(
+                      image: NetworkImage(
+                        '${ApiService.baseUrl}${item.image_url!.startsWith('/') ? '' : '/'}${item.image_url!}',
+                      ),
+                      fit: BoxFit.cover,
+                    )
+                    : null,
+            color: Colors.grey[200],
+          ),
+          child:
+              item.image_url == null
+                  ? const Icon(Icons.photo, color: Colors.grey)
+                  : null,
+        ),
+        title: Text(
+          '${item.total_detections} logo(s) detected',
+          style: const TextStyle(fontWeight: FontWeight.w500),
+        ),
+        subtitle: Text(_formatDateTime(item.timestamp)),
+        trailing: Icon(
+          item.total_detections > 0 ? Icons.check_circle : Icons.cancel,
+          color: item.total_detections > 0 ? Colors.green : Colors.red,
+        ),
+      ),
+    );
+  }
+
+  String _formatDateTime(String timestamp) {
+    try {
+      final date = DateTime.parse(timestamp);
+      return '${date.day}/${date.month}/${date.year} ${date.hour}:${date.minute.toString().padLeft(2, '0')}';
+    } catch (e) {
+      return 'Unknown';
+    }
+  }
+}
