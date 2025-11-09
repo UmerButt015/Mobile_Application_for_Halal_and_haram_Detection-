@@ -1,0 +1,188 @@
+#backend (fast api ) 
+import io
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from PIL import Image
+import tensorflow as tf
+
+app = FastAPI(title="Halal Detection API", version="1.0.0")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global variables
+model = None
+class_names = [
+    "Malaysiahalal", "Thailandhalal", "chinahalal", "europehalal", 
+    "indiahalal", "indonesiahalal", "koreanhalal", "singaporehalal", 
+    "switzerlandhalal", "unverifiedhalal", "vietnamhalal"
+]
+
+@app.on_event("startup")
+async def load_model():
+    """Load the TFLite model on startup"""
+    global model
+    try:
+        model_path = "best_float32.tflite"
+        interpreter = tf.lite.Interpreter(model_path=model_path)
+        interpreter.allocate_tensors()
+        model = interpreter
+        
+        input_details = model.get_input_details()
+        output_details = model.get_output_details()
+        
+        print("✅ YOLO model loaded successfully!")
+        print(f"📊 Input shape: {input_details[0]['shape']}")
+        print(f"📊 Output shape: {output_details[0]['shape']}")
+        
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        raise e
+
+def preprocess_image(image: Image.Image):
+    """Preprocess image for YOLO model"""
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    img = image.resize((640, 640))
+    img_array = np.array(img, dtype=np.float32)
+    img_array = img_array / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
+    
+    return img_array
+
+def yolo_postprocess(predictions, conf_threshold=0.5, iou_threshold=0.4):
+    """Process YOLOv8 predictions"""
+    predictions = predictions[0]
+    detections = []
+    num_classes = 11
+    
+    for i in range(predictions.shape[1]):
+        detection = predictions[:, i]
+        bbox = detection[:4]
+        confidence = detection[4]
+        class_probs = detection[5:5+num_classes]
+        
+        class_id = np.argmax(class_probs)
+        class_score = class_probs[class_id]
+        final_score = confidence * class_score
+        
+        if final_score > conf_threshold:
+            x_center, y_center, width, height = bbox
+            x1 = (x_center - width / 2)
+            y1 = (y_center - height / 2)
+            x2 = (x_center + width / 2)
+            y2 = (y_center + height / 2)
+            
+            x1 = np.clip(x1, 0, 1)
+            y1 = np.clip(y1, 0, 1)
+            x2 = np.clip(x2, 0, 1)
+            y2 = np.clip(y2, 0, 1)
+            
+            detections.append({
+                'bbox': [float(x1), float(y1), float(x2), float(y2)],
+                'confidence': float(final_score),
+                'class_id': int(class_id),
+                'class_name': class_names[class_id],
+                'score': float(final_score)
+            })
+    
+    return non_max_suppression(detections, iou_threshold)
+
+def non_max_suppression(detections, iou_threshold):
+    """Apply Non-Maximum Suppression"""
+    if len(detections) == 0:
+        return []
+    
+    detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
+    keep = []
+    
+    while detections:
+        best = detections.pop(0)
+        keep.append(best)
+        detections = [
+            det for det in detections 
+            if calculate_iou(best['bbox'], det['bbox']) < iou_threshold
+        ]
+    
+    return keep
+
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union"""
+    x11, y11, x21, y21 = box1
+    x12, y12, x22, y22 = box2
+    
+    xi1 = max(x11, x12)
+    yi1 = max(y11, y12)
+    xi2 = min(x21, x22)
+    yi2 = min(y21, y22)
+    
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    box1_area = (x21 - x11) * (y21 - y11)
+    box2_area = (x22 - x12) * (y22 - y12)
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Halal Detection API", 
+        "status": "active", 
+        "classes": class_names,
+        "model_loaded": model is not None
+    }
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy" if model else "unhealthy",
+        "model_loaded": model is not None,
+        "num_classes": len(class_names)
+    }
+
+@app.post("/detect")
+async def detect_halal(file: UploadFile = File(...)):
+    """Detect halal logos in uploaded image"""
+    try:
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        image_data = await file.read()
+        image = Image.open(io.BytesIO(image_data))
+        original_size = image.size
+        
+        input_data = preprocess_image(image)
+        
+        input_details = model.get_input_details()
+        output_details = model.get_output_details()
+        
+        model.set_tensor(input_details[0]['index'], input_data)
+        model.invoke()
+        predictions = model.get_tensor(output_details[0]['index'])
+        
+        detections = yolo_postprocess(predictions, conf_threshold=0.5)
+        
+        response = {
+            "detections": detections,
+            "count": len(detections),
+            "image_size": {"width": original_size[0], "height": original_size[1]},
+            "status": "success"
+        }
+        
+        return JSONResponse(content=response)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Detection error: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info") 
